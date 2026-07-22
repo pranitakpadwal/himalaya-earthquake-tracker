@@ -19,11 +19,22 @@ interface OpenMeteoFloodResponse {
   };
 }
 
-async function fetchDischarges(): Promise<Record<string, number | null>> {
+export interface RiverHistoryPoint {
+  date: string;
+  discharge: number | null;
+}
+
+interface DischargeFetchResult {
+  discharges: Record<string, number | null>;
+  histories: Record<string, RiverHistoryPoint[]>;
+}
+
+async function fetchDischarges(): Promise<DischargeFetchResult> {
   const lats = RIVER_GAUGES.map((g) => g.lat).join(",");
   const lons = RIVER_GAUGES.map((g) => g.lon).join(",");
 
-  const url = `${FLOOD_API_URL}?latitude=${lats}&longitude=${lons}&daily=river_discharge&forecast_days=1&past_days=1`;
+  // 6 days of history + today, so the client can render a short trend line.
+  const url = `${FLOOD_API_URL}?latitude=${lats}&longitude=${lons}&daily=river_discharge&forecast_days=1&past_days=6`;
 
   const res = await fetch(url, { next: { revalidate } });
   if (!res.ok) {
@@ -34,26 +45,39 @@ async function fetchDischarges(): Promise<Record<string, number | null>> {
   const results: OpenMeteoFloodResponse[] = Array.isArray(body) ? body : [body];
 
   const discharges: Record<string, number | null> = {};
+  const histories: Record<string, RiverHistoryPoint[]> = {};
+
   RIVER_GAUGES.forEach((gauge, i) => {
     const entry = results[i];
-    const series = entry?.daily?.river_discharge;
-    const latest = series?.length ? series[series.length - 1] : null;
-    discharges[gauge.id] = typeof latest === "number" ? latest : null;
+    const times = entry?.daily?.time ?? [];
+    const series = entry?.daily?.river_discharge ?? [];
+
+    const history: RiverHistoryPoint[] = times.map((date, idx) => ({
+      date,
+      discharge: typeof series[idx] === "number" ? series[idx] : null,
+    }));
+
+    histories[gauge.id] = history;
+    const latest = history.length ? history[history.length - 1].discharge : null;
+    discharges[gauge.id] = latest;
   });
 
-  return discharges;
+  return { discharges, histories };
 }
 
 export async function GET() {
   try {
-    const [discharges, recentQuakes] = await Promise.all([
+    const [{ discharges, histories }, recentQuakes] = await Promise.all([
       fetchDischarges(),
       fetchHimalayaQuakes(60)
         .then((feed) => feed.quakes)
         .catch((): HimalayaQuake[] => []),
     ]);
 
-    const assessments = assessAllRivers(discharges, recentQuakes);
+    const assessments = assessAllRivers(discharges, recentQuakes).map((a) => ({
+      ...a,
+      history: histories[a.gauge.id] ?? [],
+    }));
 
     return Response.json({
       fetchedAt: Date.now(),
